@@ -314,11 +314,22 @@ class SwedenBulkCSV:
         "postort": "city",                               # Both
         "ort": "city", "stad": "city",
         "city": "city", "kommun": "city",
+        "postadress": "address",                            # Bolagsverket alt
+        # --- postal code ---
+        # (also defined above — extra variants here)
         # --- status ---
         "status": "status", "företagsstatus": "status",
         # --- employees ---
         "anställda": "employees", "antal_anstallda": "employees",
         "employees": "employees",
+        # --- registration / deregistration ---
+        "registreringsdatum": "registration_date",           # Bolagsverket
+        "avregistreringsdatum": "deregistration_date",       # Bolagsverket
+        "avregistreringsorsak": "deregistration_reason",     # Bolagsverket
+        # --- misc Bolagsverket fields ---
+        "namnskyddslopnummer": "name_protection",            # Bolagsverket
+        "registreringsland": "registration_country",         # Bolagsverket
+        "pagandeavvecklingselleromstruktureringsforfarande": "liquidation_flag",  # Bolagsverket
     }
 
     def __init__(self, file_path: str, lookup_names: list[str]):
@@ -339,6 +350,7 @@ class SwedenBulkCSV:
         self._clean_column_names()   # strip BOM, whitespace, invisible chars
         log.info("  Columns after cleaning: %s", list(self.df.columns))
         self.col_mapping = self._map_columns()
+        log.info("  Detected column mapping: %s", self.col_mapping)
         self.name_col = self.col_mapping.get("name")
         if not self.name_col:
             print(f"\nERROR: Cannot find a company-name column in {self.path}")
@@ -620,12 +632,12 @@ def process_sheet(
         if result:
             enriched_rows.append(result.to_flat_dict())
             raw_jsons.append(result.raw_json)
-            status = f"✓ {result.matched_name[:25]} ({result.match_score:.0%})"
+            status = f"[OK] {result.matched_name[:25]} ({result.match_score:.0%})"
         else:
             empty = RegistryResult(matched_name="NOT FOUND")
             enriched_rows.append(empty.to_flat_dict())
             raw_jsons.append({})
-            status = "✗ not found"
+            status = "[NO] not found"
 
         pbar.set_postfix_str(status)
         time.sleep(delay)
