@@ -269,44 +269,54 @@ class SwedenBulkCSV:
     """
 
     # Column names → canonical field.
-    # Covers both the actual Bolagsverket bulk file column names
-    # AND common Swedish/English alternatives.
+    # Covers BOTH file formats:
+    #   - SCB bulkfil:         PeOrgNr, Namn, JuridiskForm, Gatuadress, Postnr, Postort, Ng1…
+    #   - Bolagsverket bulkfil: organisationsidentitet, organisationsnamn, organisationsform…
+    # Plus common Swedish/English alternatives.
     _COL_MAP = {
-        # name  (Bolagsverket uses "organisationsnamn")
-        "organisationsnamn": "name",
+        # --- name ---
+        "namn": "name",                                 # SCB bulkfil
+        "organisationsnamn": "name",                     # Bolagsverket bulkfil
         "företagsnamn": "name", "foretagsnamn": "name",
         "juridiskt namn": "name", "juridiskt_namn": "name",
-        "namn": "name", "name": "name", "company_name": "name",
+        "name": "name", "company_name": "name",
         "firma": "name", "bolagsnamn": "name",
-        # org number  (Bolagsverket uses "organisationsidentitet")
-        "organisationsidentitet": "org_number",
+        # --- org number ---
+        "peorgnr": "org_number",                         # SCB bulkfil
+        "organisationsidentitet": "org_number",          # Bolagsverket bulkfil
         "organisationsnummer": "org_number", "orgnr": "org_number",
         "org.nr": "org_number", "org_nr": "org_number",
         "organisationsnr": "org_number", "org_number": "org_number",
-        # legal form  (Bolagsverket uses "organisationsform")
-        "organisationsform": "legal_form",
+        # --- legal form ---
+        "juridiskform": "legal_form",                    # SCB bulkfil
+        "organisationsform": "legal_form",               # Bolagsverket bulkfil
         "företagsform": "legal_form", "foretagsform": "legal_form",
         "juridisk form": "legal_form", "bolagsform": "legal_form",
         "legal_form": "legal_form", "company_type": "legal_form",
-        # SNI / industry  (Bolagsverket uses "sni" or "verksamhetsbeskrivning")
+        # --- SNI / industry ---
+        "ng1": "industry_code",                          # SCB bulkfil (primary SNI)
+        "ng": "industry_code",
         "sni": "industry_code", "sni_kod": "industry_code",
         "sni-kod": "industry_code", "branschkod": "industry_code",
         "industry_code": "industry_code", "nace": "industry_code",
-        "verksamhetsbeskrivning": "industry_desc",
+        "verksamhetsbeskrivning": "industry_desc",       # Bolagsverket bulkfil
         "bransch": "industry_desc", "sni_beskrivning": "industry_desc",
         "industry_desc": "industry_desc", "industry_description": "industry_desc",
-        # address  (Bolagsverket uses "utdelningsadress" or "adress")
-        "utdelningsadress": "address", "adress": "address",
-        "gatuadress": "address", "address": "address",
-        # postal code
-        "postnummer": "postal_code", "postnr": "postal_code",
+        # --- address ---
+        "gatuadress": "address",                         # SCB bulkfil
+        "utdelningsadress": "address",                   # Bolagsverket bulkfil
+        "adress": "address", "address": "address",
+        # --- postal code ---
+        "postnr": "postal_code",                         # SCB bulkfil
+        "postnummer": "postal_code",
         "postal_code": "postal_code", "zipcode": "postal_code",
-        # city  (Bolagsverket uses "postort")
-        "postort": "city", "ort": "city", "stad": "city",
+        # --- city ---
+        "postort": "city",                               # Both
+        "ort": "city", "stad": "city",
         "city": "city", "kommun": "city",
-        # status
+        # --- status ---
         "status": "status", "företagsstatus": "status",
-        # employees
+        # --- employees ---
         "anställda": "employees", "antal_anstallda": "employees",
         "employees": "employees",
     }
@@ -326,16 +336,31 @@ class SwedenBulkCSV:
                  len(lookup_names), len(self._keywords))
 
         self.df = self._load_filtered()
+        self._clean_column_names()   # strip BOM, whitespace, invisible chars
+        log.info("  Columns after cleaning: %s", list(self.df.columns))
         self.col_mapping = self._map_columns()
         self.name_col = self.col_mapping.get("name")
         if not self.name_col:
-            raise ValueError(
-                f"Cannot find a company-name column in {self.path}. "
-                f"Columns found: {list(self.df.columns)}"
-            )
+            print(f"\nERROR: Cannot find a company-name column in {self.path}")
+            print(f"       Columns found: {list(self.df.columns)}")
+            print(f"       Expected one of: Namn, organisationsnamn, företagsnamn, etc.")
+            print(f"\n       Please tell me the exact column names and I'll add them.\n")
+            sys.exit(1)
         # Pre-compute normalised names for fast matching
         self.df["_norm"] = self.df[self.name_col].astype(str).apply(_normalise)
-        log.info("  Kept %d matching rows (from bulk file)", len(self.df))
+        log.info("  Kept %d matching rows (name col: '%s')", len(self.df), self.name_col)
+
+    def _clean_column_names(self):
+        """Strip BOM, invisible characters, and whitespace from column names."""
+        cleaned = []
+        for col in self.df.columns:
+            c = str(col)
+            # Remove BOM and zero-width chars
+            c = c.lstrip("\ufeff\ufffe\xef\xbb\xbf")
+            c = c.replace("\u200b", "").replace("\u00a0", " ")
+            c = c.strip()
+            cleaned.append(c)
+        self.df.columns = cleaned
 
     # ------------------------------------------------------------------
     def _detect_format(self) -> tuple[str, str]:
