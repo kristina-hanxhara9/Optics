@@ -25,6 +25,7 @@ import logging
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -513,6 +514,125 @@ def process_sheet(
 
 
 # =========================================================================
+#  Post-lookup analysis
+# =========================================================================
+# Words to ignore when counting name keywords
+_STOPWORDS = {
+    # Legal suffixes
+    "ab", "as", "asa", "aps", "a/s", "i/s", "hb", "kb", "ef", "oy", "ltd",
+    "gmbh", "inc", "co", "sa", "nv",
+    # Common filler
+    "og", "och", "and", "i", "the", "de", "van", "von", "af", "av",
+    # Country / generic
+    "danmark", "denmark", "norge", "norway", "sverige", "sweden",
+    "nordic", "scandinavia", "scandinavian", "europe",
+}
+
+
+def analyse_nace(all_enriched: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Frequency table of NACE / industry codes across all countries."""
+    rows = []
+    for sheet, df in all_enriched.items():
+        found = df[df["matched_name"] != "NOT FOUND"]
+        for _, r in found.iterrows():
+            code = str(r.get("industry_code", "")).strip()
+            desc = str(r.get("industry_desc", "")).strip()
+            if code and code.lower() != "nan":
+                rows.append({
+                    "country": sheet,
+                    "industry_code": code,
+                    "industry_desc": desc,
+                })
+
+    if not rows:
+        return pd.DataFrame(columns=["industry_code", "industry_desc",
+                                      "count", "pct", "countries"])
+
+    raw = pd.DataFrame(rows)
+
+    # Aggregate per unique code
+    grouped = (
+        raw.groupby("industry_code")
+        .agg(
+            industry_desc=("industry_desc", lambda s: s.mode().iloc[0] if len(s) else ""),
+            count=("industry_code", "size"),
+            countries=("country", lambda s: ", ".join(sorted(s.unique()))),
+        )
+        .reset_index()
+        .sort_values("count", ascending=False)
+        .reset_index(drop=True)
+    )
+    total = grouped["count"].sum()
+    grouped["pct"] = (grouped["count"] / total * 100).round(1)
+    return grouped
+
+
+def analyse_keywords(all_enriched: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Frequency table of significant words in matched business names."""
+    word_counter: Counter = Counter()
+    word_by_country: dict[str, set] = {}
+
+    for sheet, df in all_enriched.items():
+        found = df[df["matched_name"] != "NOT FOUND"]
+        for _, r in found.iterrows():
+            name = str(r.get("matched_name", ""))
+            tokens = re.findall(r"[a-zæøåäöü]+", name.lower())
+            for tok in tokens:
+                if len(tok) <= 1 or tok in _STOPWORDS:
+                    continue
+                word_counter[tok] += 1
+                word_by_country.setdefault(tok, set()).add(sheet)
+
+    if not word_counter:
+        return pd.DataFrame(columns=["keyword", "count", "pct", "countries"])
+
+    total = sum(word_counter.values())
+    rows = [
+        {
+            "keyword": w,
+            "count": c,
+            "pct": round(c / total * 100, 1),
+            "countries": ", ".join(sorted(word_by_country[w])),
+        }
+        for w, c in word_counter.most_common()
+    ]
+    return pd.DataFrame(rows)
+
+
+def print_analysis(nace_df: pd.DataFrame, kw_df: pd.DataFrame) -> None:
+    """Print analysis tables to the console."""
+
+    print()
+    print("=" * 60)
+    print("  NACE / INDUSTRY CODE ANALYSIS")
+    print("=" * 60)
+    if nace_df.empty:
+        print("  No industry codes found.")
+    else:
+        top = nace_df.head(15)
+        for _, r in top.iterrows():
+            desc = r["industry_desc"][:40] if r["industry_desc"] else ""
+            print(f"  {r['industry_code']:>8s}  {r['count']:4d}  ({r['pct']:5.1f}%)  "
+                  f"{desc:40s}  [{r['countries']}]")
+        if len(nace_df) > 15:
+            print(f"  … and {len(nace_df) - 15} more codes (see output Excel)")
+
+    print()
+    print("=" * 60)
+    print("  NAME KEYWORD ANALYSIS")
+    print("=" * 60)
+    if kw_df.empty:
+        print("  No keywords found.")
+    else:
+        top = kw_df.head(25)
+        for _, r in top.iterrows():
+            print(f"  {r['keyword']:25s}  {r['count']:4d}  ({r['pct']:5.1f}%)  "
+                  f"[{r['countries']}]")
+        if len(kw_df) > 25:
+            print(f"  … and {len(kw_df) - 25} more keywords (see output Excel)")
+
+
+# =========================================================================
 #  Main
 # =========================================================================
 def main() -> None:
@@ -637,12 +757,21 @@ GETTING THE SWEDISH BULK DATA
         log.warning("Nothing to write.")
         sys.exit(0)
 
+    # --- analysis ---------------------------------------------------------
+    log.info("\nRunning post-lookup analysis …")
+    nace_df = analyse_nace(results)
+    kw_df = analyse_keywords(results)
+
     # --- write output -----------------------------------------------------
-    log.info("\nWriting → %s", dest)
+    log.info("Writing → %s", dest)
     with pd.ExcelWriter(dest, engine="openpyxl") as writer:
         for sheet_name, edf in results.items():
             edf.to_excel(writer, sheet_name=sheet_name, index=False)
         pd.DataFrame(summary_rows).to_excel(writer, sheet_name="Summary", index=False)
+        if not nace_df.empty:
+            nace_df.to_excel(writer, sheet_name="NACE Analysis", index=False)
+        if not kw_df.empty:
+            kw_df.to_excel(writer, sheet_name="Keyword Analysis", index=False)
 
     # --- console summary --------------------------------------------------
     print()
@@ -653,6 +782,9 @@ GETTING THE SWEDISH BULK DATA
         print(f"  {r['Country']:20s}  {r['Found']}/{r['Total']} found  ({r['Match Rate']})")
     print(f"\n  Output → {dest}")
     print("=" * 60)
+
+    # --- console analysis -------------------------------------------------
+    print_analysis(nace_df, kw_df)
 
 
 if __name__ == "__main__":
