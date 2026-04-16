@@ -428,42 +428,58 @@ class SwedenBulkCSV:
         return (",", "latin-1")  # fallback
 
     def _load_filtered(self) -> pd.DataFrame:
-        """Stream the bulk file in chunks, keeping only rows whose name
-        column contains at least one keyword from our lookup list."""
+        """Load ONLY matching rows from the bulk file.
+        Step 1: fast raw-text scan to collect matching line numbers.
+        Step 2: read only header + those lines with pandas.
+        This avoids pandas parsing millions of irrelevant rows."""
         fmt, enc = self._detect_format()
 
         if fmt == "excel":
             df = pd.read_excel(self.path, dtype=str)
             return self._filter_df(df)
 
-        log.info("  Detected sep=%r encoding=%s — streaming in chunks …", fmt, enc)
+        log.info("  Detected sep=%r encoding=%s", fmt, enc)
 
-        # Read in chunks to avoid loading everything into memory
-        kept: list[pd.DataFrame] = []
-        chunk_iter = pd.read_csv(
-            self.path, sep=fmt, dtype=str, encoding=enc,
-            on_bad_lines="skip", chunksize=50_000,
-        )
-        name_col = None
-        for chunk in chunk_iter:
-            # Clean column names on every chunk (BOM, whitespace, etc.)
-            chunk.columns = [self._strip_bom(c) for c in chunk.columns]
-            if name_col is None:
-                name_col = self._find_name_col(chunk.columns)
-                log.info("  Bulk file columns: %s", list(chunk.columns))
-                log.info("  Name column detected: %s", name_col)
-            if name_col is None:
-                kept.append(chunk)  # can't filter, keep all
-                continue
-            filtered = self._filter_chunk(chunk, name_col)
-            if not filtered.empty:
-                kept.append(filtered)
+        if not self._keywords:
+            log.info("  No keywords — loading full file")
+            df = pd.read_csv(self.path, sep=fmt, dtype=str, encoding=enc,
+                             on_bad_lines="skip")
+            df.columns = [self._strip_bom(c) for c in df.columns]
+            return df
 
-        if not kept:
+        # --- Fast pre-filter: scan raw text, keep only matching lines ---
+        import io
+        log.info("  Fast-scanning %s for %d keywords …", self.path.name, len(self._keywords))
+        kw_lower = [kw.lower() for kw in self._keywords]
+
+        header_line = None
+        matching_lines = []
+        with open(self.path, encoding=enc, errors="replace") as fh:
+            for i, line in enumerate(fh):
+                if i == 0:
+                    header_line = line
+                    continue
+                line_lower = line.lower()
+                if any(kw in line_lower for kw in kw_lower):
+                    matching_lines.append(line)
+
+        log.info("  Scanned file → %d matching lines (out of %d total)",
+                 len(matching_lines), i)
+
+        if not matching_lines:
             return pd.DataFrame()
-        result = pd.concat(kept, ignore_index=True)
-        log.info("  Streamed bulk file → kept %d rows", len(result))
-        return result
+
+        # --- Parse only the matching lines with pandas ---
+        filtered_text = header_line + "".join(matching_lines)
+        df = pd.read_csv(io.StringIO(filtered_text), sep=fmt, dtype=str,
+                         on_bad_lines="skip")
+        df.columns = [self._strip_bom(c) for c in df.columns]
+
+        name_col = self._find_name_col(df.columns)
+        log.info("  Bulk file columns: %s", list(df.columns))
+        log.info("  Name column detected: %s", name_col)
+        log.info("  Loaded %d matching rows", len(df))
+        return df
 
     @staticmethod
     def _strip_bom(s: str) -> str:
