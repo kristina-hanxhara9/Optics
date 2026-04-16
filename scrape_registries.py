@@ -235,23 +235,24 @@ class SwedenBulkCSV:
     Matches Swedish optics shop names against a locally downloaded bulk file
     from Bolagsverket (Swedish Companies Registration Office).
 
-    Where to get the data
-    ---------------------
-    1. Bolagsverket open data (Näringslivsregistret):
-       https://bolagsverket.se/omoss/oppnadata
+    Where to get the data (FREE, no account needed)
+    ------------------------------------------------
+    Go to Bolagsverket's download page:
+      https://bolagsverket.se/apierochoppnadata/nedladdningsbarafiler.2517.html
 
-    2. Swedish government open-data portal:
-       https://www.dataportal.se/  (search "företagsregistret")
+    Download one of:
+      - bolagsverket_bulkfil.zip  (company data from Bolagsverket)
+      - scb_bulkfil.zip           (company data from SCB / Statistics Sweden)
 
-    3. SCB (Statistics Sweden) enterprise data:
-       https://www.statistikdatabasen.scb.se/
-       → Näringsverksamhet → Företagsdatabasen
+    Unzip → .txt file.  Pass it with  --sweden-csv <file.txt>
 
-    The file should be a CSV or Excel with at minimum a company-name column.
-    Extra columns (org number, SNI code, address, …) will be auto-detected
-    and included in the output.
+    These are "Värdefulla datamängder" (EU High-Value Datasets), released
+    Feb 2025.  Updated weekly, completely free, no contract.
 
-    Supported formats: .csv  .tsv  .xlsx  .xls
+    Contents: org number, company name, legal form, address, SNI codes,
+    business description, and more.
+
+    Supported formats: .csv  .tsv  .txt  .xlsx  .xls
     """
 
     # Common Swedish column names → our canonical field
@@ -652,15 +653,12 @@ REGISTRIES
   Denmark  CVR / cvrapi.dk   cvrapi.dk                    Free REST, User-Agent
   Sweden   Bolagsverket CSV  bolagsverket.se/oppnadata    Bulk download, local match
 
-GETTING THE SWEDISH BULK DATA
-  1. Bolagsverket Näringslivsregistret (open data):
-     https://bolagsverket.se/omoss/oppnadata
-  2. Swedish open-data portal:
-     https://www.dataportal.se/  → search "företagsregistret"
-  3. SCB Företagsdatabasen:
-     https://www.statistikdatabasen.scb.se/
-     → Näringsverksamhet → Företagsdatabasen
-  Download as CSV/XLSX and pass with --sweden-csv <path>
+GETTING THE SWEDISH BULK DATA (FREE, no account needed)
+  1. Go to: https://bolagsverket.se/apierochoppnadata/nedladdningsbarafiler.2517.html
+  2. Download "bolagsverket_bulkfil.zip" or "scb_bulkfil.zip"
+  3. Unzip → .txt file
+  4. Pass with --sweden-csv <file.txt>
+  These are EU "High-Value Datasets", free since Feb 2025, updated weekly.
 """,
     )
     ap.add_argument("input_file", help="Excel file (.xlsx) with optics shop names")
@@ -700,9 +698,10 @@ GETTING THE SWEDISH BULK DATA
     else:
         log.info(
             "No --sweden-csv provided. Sweden lookups will be skipped.\n"
-            "  To enable Sweden, download the Bolagsverket bulk file and rerun with:\n"
-            "    --sweden-csv <path-to-file.csv>\n"
-            "  See --help for download links."
+            "  To enable Sweden:\n"
+            "  1. Download from: https://bolagsverket.se/apierochoppnadata/nedladdningsbarafiler.2517.html\n"
+            "     → bolagsverket_bulkfil.zip  (free, no account needed)\n"
+            "  2. Unzip and rerun with:  --sweden-csv bolagsverket_bulkfil.txt"
         )
 
     # --- read input -------------------------------------------------------
