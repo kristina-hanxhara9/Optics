@@ -268,34 +268,40 @@ class SwedenBulkCSV:
     Supported formats: .csv  .tsv  .txt  .xlsx  .xls
     """
 
-    # Common Swedish column names → our canonical field
+    # Column names → canonical field.
+    # Covers both the actual Bolagsverket bulk file column names
+    # AND common Swedish/English alternatives.
     _COL_MAP = {
-        # name
+        # name  (Bolagsverket uses "organisationsnamn")
+        "organisationsnamn": "name",
         "företagsnamn": "name", "foretagsnamn": "name",
         "juridiskt namn": "name", "juridiskt_namn": "name",
         "namn": "name", "name": "name", "company_name": "name",
         "firma": "name", "bolagsnamn": "name",
-        # org number
+        # org number  (Bolagsverket uses "organisationsidentitet")
+        "organisationsidentitet": "org_number",
         "organisationsnummer": "org_number", "orgnr": "org_number",
         "org.nr": "org_number", "org_nr": "org_number",
         "organisationsnr": "org_number", "org_number": "org_number",
-        # legal form
+        # legal form  (Bolagsverket uses "organisationsform")
+        "organisationsform": "legal_form",
         "företagsform": "legal_form", "foretagsform": "legal_form",
         "juridisk form": "legal_form", "bolagsform": "legal_form",
         "legal_form": "legal_form", "company_type": "legal_form",
-        # SNI / industry
+        # SNI / industry  (Bolagsverket uses "sni" or "verksamhetsbeskrivning")
         "sni": "industry_code", "sni_kod": "industry_code",
         "sni-kod": "industry_code", "branschkod": "industry_code",
         "industry_code": "industry_code", "nace": "industry_code",
+        "verksamhetsbeskrivning": "industry_desc",
         "bransch": "industry_desc", "sni_beskrivning": "industry_desc",
         "industry_desc": "industry_desc", "industry_description": "industry_desc",
-        # address
-        "adress": "address", "gatuadress": "address",
-        "address": "address", "utdelningsadress": "address",
+        # address  (Bolagsverket uses "utdelningsadress" or "adress")
+        "utdelningsadress": "address", "adress": "address",
+        "gatuadress": "address", "address": "address",
         # postal code
         "postnummer": "postal_code", "postnr": "postal_code",
         "postal_code": "postal_code", "zipcode": "postal_code",
-        # city
+        # city  (Bolagsverket uses "postort")
         "postort": "city", "ort": "city", "stad": "city",
         "city": "city", "kommun": "city",
         # status
@@ -385,14 +391,14 @@ class SwedenBulkCSV:
         return result
 
     def _find_name_col(self, columns) -> str | None:
-        """Find the name column from headers."""
-        name_hints = ["företagsnamn", "foretagsnamn", "namn", "name",
-                      "juridiskt namn", "firma", "bolagsnamn", "company_name"]
+        """Find the name column from headers using _COL_MAP."""
         for col in columns:
-            if col.lower().strip().replace("_", " ") in name_hints:
+            key = col.lower().strip().replace(" ", "_")
+            if self._COL_MAP.get(key) == "name":
                 return col
-            for hint in name_hints:
-                if hint in col.lower():
+            # Also try substring match (e.g. "organisationsnamn" in a longer header)
+            for map_key, canonical in self._COL_MAP.items():
+                if canonical == "name" and map_key in col.lower():
                     return col
         return None
 
@@ -420,10 +426,18 @@ class SwedenBulkCSV:
         mapping: dict[str, str] = {}   # canonical → original col name
         for col in self.df.columns:
             key = col.lower().strip().replace(" ", "_")
+            # Exact match first
             if key in self._COL_MAP:
                 canonical = self._COL_MAP[key]
                 if canonical not in mapping:
                     mapping[canonical] = col
+                continue
+            # Substring match (e.g. column "sni_kod_1" matches "sni_kod")
+            for map_key, canonical in self._COL_MAP.items():
+                if map_key in key and canonical not in mapping:
+                    mapping[canonical] = col
+                    break
+        log.info("  Column mapping: %s", mapping)
         return mapping
 
     # ------------------------------------------------------------------
