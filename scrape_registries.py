@@ -305,10 +305,21 @@ class SwedenBulkCSV:
         "employees": "employees",
     }
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, lookup_names: list[str]):
         self.path = Path(file_path)
-        log.info("Loading Swedish bulk data from %s …", self.path)
-        self.df = self._load()
+        self.lookup_names = lookup_names
+
+        # Build keywords from the names we actually need to find
+        self._keywords = set()
+        for name in lookup_names:
+            for word in _normalise(name).split():
+                if len(word) > 2:
+                    self._keywords.add(word)
+        log.info("Swedish bulk file: %s", self.path)
+        log.info("  Filtering for %d shop names (%d keywords)",
+                 len(lookup_names), len(self._keywords))
+
+        self.df = self._load_filtered()
         self.col_mapping = self._map_columns()
         self.name_col = self.col_mapping.get("name")
         if not self.name_col:
@@ -318,29 +329,91 @@ class SwedenBulkCSV:
             )
         # Pre-compute normalised names for fast matching
         self.df["_norm"] = self.df[self.name_col].astype(str).apply(_normalise)
-        log.info("  Loaded %d Swedish companies (name col: '%s')", len(self.df), self.name_col)
+        log.info("  Kept %d matching rows (from bulk file)", len(self.df))
 
     # ------------------------------------------------------------------
-    def _load(self) -> pd.DataFrame:
+    def _detect_format(self) -> tuple[str, str]:
+        """Read just the first few lines to figure out separator + encoding."""
         suffix = self.path.suffix.lower()
         if suffix in (".xlsx", ".xls"):
-            return pd.read_excel(self.path, dtype=str)
+            return ("excel", "")
 
-        # Try as delimited text regardless of extension (.csv .tsv .txt or anything else)
         for enc in ["utf-8", "latin-1", "cp1252"]:
             for sep in [";", ",", "\t", "|"]:
                 try:
                     df = pd.read_csv(self.path, sep=sep, dtype=str,
-                                     encoding=enc, on_bad_lines="skip")
+                                     encoding=enc, on_bad_lines="skip", nrows=5)
                     if len(df.columns) > 1:
-                        log.info("  Parsed with sep=%r  encoding=%s  cols=%d",
-                                 sep, enc, len(df.columns))
-                        return df
+                        return (sep, enc)
                 except Exception:
                     continue
-        # last resort: auto-detect
-        return pd.read_csv(self.path, dtype=str, encoding="latin-1",
-                           on_bad_lines="skip")
+        return (",", "latin-1")  # fallback
+
+    def _load_filtered(self) -> pd.DataFrame:
+        """Stream the bulk file in chunks, keeping only rows whose name
+        column contains at least one keyword from our lookup list."""
+        fmt, enc = self._detect_format()
+
+        if fmt == "excel":
+            df = pd.read_excel(self.path, dtype=str)
+            return self._filter_df(df)
+
+        log.info("  Detected sep=%r encoding=%s — streaming in chunks …", fmt, enc)
+
+        # Read in chunks to avoid loading everything into memory
+        kept: list[pd.DataFrame] = []
+        chunk_iter = pd.read_csv(
+            self.path, sep=fmt, dtype=str, encoding=enc,
+            on_bad_lines="skip", chunksize=50_000,
+        )
+        name_col = None
+        for chunk in chunk_iter:
+            if name_col is None:
+                # Detect the name column from first chunk's headers
+                name_col = self._find_name_col(chunk.columns)
+            if name_col is None:
+                kept.append(chunk)  # can't filter, keep all
+                continue
+            filtered = self._filter_chunk(chunk, name_col)
+            if not filtered.empty:
+                kept.append(filtered)
+
+        if not kept:
+            return pd.DataFrame()
+        result = pd.concat(kept, ignore_index=True)
+        log.info("  Streamed bulk file → kept %d rows", len(result))
+        return result
+
+    def _find_name_col(self, columns) -> str | None:
+        """Find the name column from headers."""
+        name_hints = ["företagsnamn", "foretagsnamn", "namn", "name",
+                      "juridiskt namn", "firma", "bolagsnamn", "company_name"]
+        for col in columns:
+            if col.lower().strip().replace("_", " ") in name_hints:
+                return col
+            for hint in name_hints:
+                if hint in col.lower():
+                    return col
+        return None
+
+    def _filter_chunk(self, chunk: pd.DataFrame, name_col: str) -> pd.DataFrame:
+        """Keep only rows where the name contains any of our keywords."""
+        if not self._keywords:
+            return chunk
+        lower_names = chunk[name_col].astype(str).str.lower()
+        pattern = "|".join(re.escape(kw) for kw in self._keywords)
+        mask = lower_names.str.contains(pattern, na=False)
+        return chunk[mask]
+
+    def _filter_df(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Filter a fully-loaded DataFrame (for Excel files)."""
+        name_col = self._find_name_col(df.columns)
+        if name_col is None or not self._keywords:
+            return df
+        lower_names = df[name_col].astype(str).str.lower()
+        pattern = "|".join(re.escape(kw) for kw in self._keywords)
+        mask = lower_names.str.contains(pattern, na=False)
+        return df[mask].reset_index(drop=True)
 
     def _map_columns(self) -> dict[str, str]:
         """Map bulk-file columns to canonical field names."""
@@ -710,12 +783,26 @@ GETTING THE SWEDISH BULK DATA (FREE, no account needed)
         "denmark": DenmarkCVR(user_agent=args.user_agent),
     }
 
+    # --- read input (before Sweden init, so we know which names to look up) -
+    sheets = read_input(str(src))
+
+    # --- Sweden: extract lookup names first, then load only matching rows --
     if args.sweden_csv:
         csv_path = Path(args.sweden_csv)
         if not csv_path.exists():
             print(f"ERROR: Swedish data file not found: {csv_path}")
             sys.exit(1)
-        registries["sweden"] = SwedenBulkCSV(str(csv_path))
+        # Get the Swedish shop names from the Excel
+        se_names = []
+        for country, info in sheets.items():
+            if country == "sweden":
+                col = args.name_column or _detect_name_column(info["df"])
+                se_names = info["df"][col].dropna().astype(str).str.strip().tolist()
+                se_names = [n for n in se_names if n and n.lower() != "nan"]
+        if se_names:
+            registries["sweden"] = SwedenBulkCSV(str(csv_path), se_names)
+        else:
+            log.warning("No Swedish shop names found in Excel — skipping Sweden")
     else:
         log.info(
             "No --sweden-csv provided. Sweden lookups will be skipped.\n"
@@ -724,9 +811,6 @@ GETTING THE SWEDISH BULK DATA (FREE, no account needed)
             "     → bolagsverket_bulkfil.zip  (free, no account needed)\n"
             "  2. Unzip and rerun with:  --sweden-csv bolagsverket_bulkfil.txt"
         )
-
-    # --- read input -------------------------------------------------------
-    sheets = read_input(str(src))
 
     # --- process ----------------------------------------------------------
     results: dict[str, pd.DataFrame] = {}
