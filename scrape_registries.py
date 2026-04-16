@@ -8,24 +8,26 @@ and enriches each entry with official business registry data.
 Registries used:
   - Norway:  Bronnøysundregistrene (BRREG) — Free REST API, no auth
   - Denmark: CVR via cvrapi.dk — Free REST API (User-Agent required)
-  - Sweden:  OpenCorporates — Free tier REST API (500 req/month, no auth)
+  - Sweden:  Bolagsverket bulk CSV — downloaded from
+             https://bolagsverket.se/omoss/oppnadata  (Näringslivsregistret)
+             Loaded locally and matched by company name.
 
 Usage:
   python scrape_registries.py optics_shops.xlsx
+  python scrape_registries.py optics_shops.xlsx --sweden-csv swedish_companies.csv
   python scrape_registries.py optics_shops.xlsx -o enriched.xlsx --delay 1.0
-  python scrape_registries.py optics_shops.xlsx --name-column "Business Name"
   python scrape_registries.py optics_shops.xlsx --countries norway denmark
 """
 
 import argparse
 import json
 import logging
+import re
 import sys
 import time
 from dataclasses import dataclass, field, asdict
 from difflib import SequenceMatcher
 from pathlib import Path
-from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
@@ -118,6 +120,14 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a.lower().strip(), b.lower().strip()).ratio()
 
 
+def _normalise(name: str) -> str:
+    """Lower-case, strip common suffixes (AB, AS, ApS, HB …) for matching."""
+    n = name.lower().strip()
+    n = re.sub(r"\b(ab|hb|kb|ef|as|asa|aps|a/s|i/s)\s*$", "", n).strip()
+    n = re.sub(r"[^\w\s]", " ", n)           # punctuation → space
+    return re.sub(r"\s+", " ", n).strip()     # collapse whitespace
+
+
 # =========================================================================
 #  NORWAY  —  Brønnøysundregistrene (BRREG)
 # =========================================================================
@@ -140,7 +150,6 @@ class NorwayBRREG:
         best = self._pick_best(name, units)
         return self._parse(name, best)
 
-    # ------------------------------------------------------------------
     def _pick_best(self, query: str, units: list[dict]) -> dict:
         scored = [(u, _similarity(query, u.get("navn", ""))) for u in units]
         scored.sort(key=lambda t: t[1], reverse=True)
@@ -218,67 +227,185 @@ class DenmarkCVR:
 
 
 # =========================================================================
-#  SWEDEN  —  OpenCorporates (free tier)
+#  SWEDEN  —  Bolagsverket bulk data (local CSV / XLSX)
 # =========================================================================
-class SwedenOpenCorporates:
+class SwedenBulkCSV:
     """
-    Docs: https://api.opencorporates.com/documentation/API-Reference
-    Free tier: anonymous access, rate-limited.
-    Covers Bolagsverket data.
+    Matches Swedish optics shop names against a locally downloaded bulk file
+    from Bolagsverket (Swedish Companies Registration Office).
+
+    Where to get the data
+    ---------------------
+    1. Bolagsverket open data (Näringslivsregistret):
+       https://bolagsverket.se/omoss/oppnadata
+
+    2. Swedish government open-data portal:
+       https://www.dataportal.se/  (search "företagsregistret")
+
+    3. SCB (Statistics Sweden) enterprise data:
+       https://www.statistikdatabasen.scb.se/
+       → Näringsverksamhet → Företagsdatabasen
+
+    The file should be a CSV or Excel with at minimum a company-name column.
+    Extra columns (org number, SNI code, address, …) will be auto-detected
+    and included in the output.
+
+    Supported formats: .csv  .tsv  .xlsx  .xls
     """
-    BASE = "https://api.opencorporates.com/v0.4/companies/search"
 
-    def search(self, name: str) -> RegistryResult | None:
-        data = _get_json(
-            self.BASE,
-            params={
-                "q": name,
-                "jurisdiction_code": "se",
-                "per_page": 5,
-                "order": "score",
-            },
-        )
-        if not data:
-            return None
+    # Common Swedish column names → our canonical field
+    _COL_MAP = {
+        # name
+        "företagsnamn": "name", "foretagsnamn": "name",
+        "juridiskt namn": "name", "juridiskt_namn": "name",
+        "namn": "name", "name": "name", "company_name": "name",
+        "firma": "name", "bolagsnamn": "name",
+        # org number
+        "organisationsnummer": "org_number", "orgnr": "org_number",
+        "org.nr": "org_number", "org_nr": "org_number",
+        "organisationsnr": "org_number", "org_number": "org_number",
+        # legal form
+        "företagsform": "legal_form", "foretagsform": "legal_form",
+        "juridisk form": "legal_form", "bolagsform": "legal_form",
+        "legal_form": "legal_form", "company_type": "legal_form",
+        # SNI / industry
+        "sni": "industry_code", "sni_kod": "industry_code",
+        "sni-kod": "industry_code", "branschkod": "industry_code",
+        "industry_code": "industry_code", "nace": "industry_code",
+        "bransch": "industry_desc", "sni_beskrivning": "industry_desc",
+        "industry_desc": "industry_desc", "industry_description": "industry_desc",
+        # address
+        "adress": "address", "gatuadress": "address",
+        "address": "address", "utdelningsadress": "address",
+        # postal code
+        "postnummer": "postal_code", "postnr": "postal_code",
+        "postal_code": "postal_code", "zipcode": "postal_code",
+        # city
+        "postort": "city", "ort": "city", "stad": "city",
+        "city": "city", "kommun": "city",
+        # status
+        "status": "status", "företagsstatus": "status",
+        # employees
+        "anställda": "employees", "antal_anstallda": "employees",
+        "employees": "employees",
+    }
 
-        companies = data.get("results", {}).get("companies", [])
-        if not companies:
-            return None
-
-        best = self._pick_best(name, companies)
-        return self._parse(name, best)
+    def __init__(self, file_path: str):
+        self.path = Path(file_path)
+        log.info("Loading Swedish bulk data from %s …", self.path)
+        self.df = self._load()
+        self.col_mapping = self._map_columns()
+        self.name_col = self.col_mapping.get("name")
+        if not self.name_col:
+            raise ValueError(
+                f"Cannot find a company-name column in {self.path}. "
+                f"Columns found: {list(self.df.columns)}"
+            )
+        # Pre-compute normalised names for fast matching
+        self.df["_norm"] = self.df[self.name_col].astype(str).apply(_normalise)
+        log.info("  Loaded %d Swedish companies (name col: '%s')", len(self.df), self.name_col)
 
     # ------------------------------------------------------------------
-    def _pick_best(self, query: str, items: list[dict]) -> dict:
-        scored = [
-            (it, _similarity(query, it.get("company", {}).get("name", "")))
-            for it in items
-        ]
-        scored.sort(key=lambda t: t[1], reverse=True)
-        return scored[0][0]
+    def _load(self) -> pd.DataFrame:
+        suffix = self.path.suffix.lower()
+        if suffix in (".csv", ".tsv"):
+            for sep in [",", ";", "\t", "|"]:
+                try:
+                    df = pd.read_csv(self.path, sep=sep, dtype=str,
+                                     encoding="utf-8", on_bad_lines="skip")
+                    if len(df.columns) > 1:
+                        return df
+                except Exception:
+                    continue
+            # last resort: single-column / auto
+            return pd.read_csv(self.path, dtype=str, encoding="utf-8",
+                               on_bad_lines="skip")
+        elif suffix in (".xlsx", ".xls"):
+            return pd.read_excel(self.path, dtype=str)
+        else:
+            raise ValueError(f"Unsupported file type: {suffix}")
 
-    def _parse(self, query: str, item: dict) -> RegistryResult:
-        c = item.get("company", {})
-        addr = c.get("registered_address") or {}
+    def _map_columns(self) -> dict[str, str]:
+        """Map bulk-file columns to canonical field names."""
+        mapping: dict[str, str] = {}   # canonical → original col name
+        for col in self.df.columns:
+            key = col.lower().strip().replace(" ", "_")
+            if key in self._COL_MAP:
+                canonical = self._COL_MAP[key]
+                if canonical not in mapping:
+                    mapping[canonical] = col
+        return mapping
 
-        ind_codes = c.get("industry_codes") or []
-        ind_code = ind_codes[0].get("industry_code", {}).get("code", "") if ind_codes else ""
-        ind_desc = ind_codes[0].get("industry_code", {}).get("description", "") if ind_codes else ""
+    # ------------------------------------------------------------------
+    def search(self, name: str) -> RegistryResult | None:
+        query_norm = _normalise(name)
+        if not query_norm:
+            return None
+
+        # 1) Exact normalised match
+        exact = self.df[self.df["_norm"] == query_norm]
+        if not exact.empty:
+            return self._build(name, exact.iloc[0], 1.0)
+
+        # 2) Substring: bulk name contains the query (or vice-versa)
+        mask_contains = self.df["_norm"].str.contains(
+            re.escape(query_norm), na=False
+        )
+        subset = self.df[mask_contains]
+        if not subset.empty:
+            # pick the shortest name (most specific match)
+            best_idx = subset[self.name_col].str.len().idxmin()
+            row = subset.loc[best_idx]
+            score = _similarity(name, str(row[self.name_col]))
+            return self._build(name, row, score)
+
+        # 3) Token overlap — keep rows sharing ≥1 significant word
+        words = [w for w in query_norm.split() if len(w) > 2]
+        if words:
+            pattern = "|".join(re.escape(w) for w in words)
+            mask_tok = self.df["_norm"].str.contains(pattern, na=False)
+            candidates = self.df[mask_tok]
+        else:
+            candidates = self.df
+
+        if candidates.empty:
+            return None
+
+        # 4) Fuzzy-score the candidates (cap at 2000 to stay fast)
+        if len(candidates) > 2000:
+            candidates = candidates.head(2000)
+
+        scores = candidates[self.name_col].apply(
+            lambda x: _similarity(name, str(x))
+        )
+        best_idx = scores.idxmax()
+        best_score = scores[best_idx]
+        if best_score < 0.45:
+            return None
+        return self._build(name, candidates.loc[best_idx], best_score)
+
+    # ------------------------------------------------------------------
+    def _build(self, query: str, row: pd.Series, score: float) -> RegistryResult:
+        def _g(canonical: str) -> str:
+            col = self.col_mapping.get(canonical)
+            if col is None:
+                return ""
+            val = row.get(col, "")
+            return "" if pd.isna(val) else str(val).strip()
 
         return RegistryResult(
-            matched_name=c.get("name", ""),
-            org_number=c.get("company_number", ""),
-            legal_form=c.get("company_type", ""),
-            address=addr.get("street_address", "") or "",
-            postal_code=addr.get("postal_code", "") or "",
-            city=addr.get("locality", "") or "",
+            matched_name=_g("name"),
+            org_number=_g("org_number"),
+            legal_form=_g("legal_form"),
+            address=_g("address"),
+            postal_code=_g("postal_code"),
+            city=_g("city"),
             country="Sweden",
-            industry_code=ind_code,
-            industry_desc=ind_desc,
-            status=c.get("current_status", "") or "",
-            registration_date=c.get("incorporation_date", "") or "",
-            match_score=round(_similarity(query, c.get("name", "")), 3),
-            raw_json=c,
+            industry_code=_g("industry_code"),
+            industry_desc=_g("industry_desc"),
+            status=_g("status") or "Unknown",
+            employees=_g("employees"),
+            match_score=round(score, 3),
         )
 
 
@@ -309,7 +436,10 @@ def _detect_country(sheet_name: str, index: int) -> str:
 
 
 def _detect_name_column(df: pd.DataFrame) -> str:
-    """Guess which column holds the business names."""
+    """Guess which column holds the business names.
+    If the sheet has only one column, just return it."""
+    if len(df.columns) == 1:
+        return df.columns[0]
     for col in df.columns:
         for hint in NAME_HINTS:
             if hint in str(col).lower():
@@ -392,15 +522,25 @@ def main() -> None:
         epilog="""
 EXAMPLES
   python scrape_registries.py optics_shops.xlsx
+  python scrape_registries.py optics_shops.xlsx --sweden-csv swedish_companies.csv
   python scrape_registries.py optics_shops.xlsx -o enriched.xlsx
-  python scrape_registries.py optics_shops.xlsx --name-column "Butik"
-  python scrape_registries.py optics_shops.xlsx --countries norway sweden
+  python scrape_registries.py optics_shops.xlsx --countries norway denmark
   python scrape_registries.py optics_shops.xlsx --delay 1.5 --json
 
 REGISTRIES
-  Norway   BRREG            data.brreg.no        Free REST, no auth
-  Denmark  CVR / cvrapi.dk  cvrapi.dk            Free REST, User-Agent
-  Sweden   OpenCorporates   api.opencorporates   Free tier (rate-limited)
+  Norway   BRREG             data.brreg.no                Free REST, no auth
+  Denmark  CVR / cvrapi.dk   cvrapi.dk                    Free REST, User-Agent
+  Sweden   Bolagsverket CSV  bolagsverket.se/oppnadata    Bulk download, local match
+
+GETTING THE SWEDISH BULK DATA
+  1. Bolagsverket Näringslivsregistret (open data):
+     https://bolagsverket.se/omoss/oppnadata
+  2. Swedish open-data portal:
+     https://www.dataportal.se/  → search "företagsregistret"
+  3. SCB Företagsdatabasen:
+     https://www.statistikdatabasen.scb.se/
+     → Näringsverksamhet → Företagsdatabasen
+  Download as CSV/XLSX and pass with --sweden-csv <path>
 """,
     )
     ap.add_argument("input_file", help="Excel file (.xlsx) with optics shop names")
@@ -413,6 +553,9 @@ REGISTRIES
     ap.add_argument("--json", action="store_true", help="Also dump raw JSON per country")
     ap.add_argument("--user-agent", default="OpticsScraper/1.0 (contact@example.com)",
                     help="User-Agent for cvrapi.dk  [default: generic]")
+    ap.add_argument("--sweden-csv", metavar="PATH",
+                    help="Path to Swedish bulk company data (CSV/XLSX) from Bolagsverket. "
+                         "Required for Sweden lookups.")
     args = ap.parse_args()
 
     src = Path(args.input_file)
@@ -423,11 +566,24 @@ REGISTRIES
     dest = Path(args.output) if args.output else src.with_name(f"{src.stem}_enriched.xlsx")
 
     # --- registries -------------------------------------------------------
-    registries = {
+    registries: dict = {
         "norway":  NorwayBRREG(),
         "denmark": DenmarkCVR(user_agent=args.user_agent),
-        "sweden":  SwedenOpenCorporates(),
     }
+
+    if args.sweden_csv:
+        csv_path = Path(args.sweden_csv)
+        if not csv_path.exists():
+            log.error("Swedish data file not found: %s", csv_path)
+            sys.exit(1)
+        registries["sweden"] = SwedenBulkCSV(str(csv_path))
+    else:
+        log.info(
+            "No --sweden-csv provided. Sweden lookups will be skipped.\n"
+            "  To enable Sweden, download the Bolagsverket bulk file and rerun with:\n"
+            "    --sweden-csv <path-to-file.csv>\n"
+            "  See --help for download links."
+        )
 
     # --- read input -------------------------------------------------------
     sheets = read_input(str(src))
@@ -441,7 +597,7 @@ REGISTRIES
             log.info("Skipping %s (filtered out)", country)
             continue
         if country not in registries:
-            log.warning("No registry for '%s' — skipping", country)
+            log.warning("No registry for '%s' — skipping (see --help)", country)
             continue
 
         df = info["df"]
