@@ -416,7 +416,7 @@ class SwedenBulkCSV:
         if suffix in (".xlsx", ".xls"):
             return ("excel", "")
 
-        for enc in ["utf-8", "latin-1", "cp1252"]:
+        for enc in ["utf-8-sig", "utf-8", "latin-1", "cp1252"]:
             for sep in [";", ",", "\t", "|"]:
                 try:
                     df = pd.read_csv(self.path, sep=sep, dtype=str,
@@ -446,9 +446,12 @@ class SwedenBulkCSV:
         )
         name_col = None
         for chunk in chunk_iter:
+            # Clean column names on every chunk (BOM, whitespace, etc.)
+            chunk.columns = [self._strip_bom(c) for c in chunk.columns]
             if name_col is None:
-                # Detect the name column from first chunk's headers
                 name_col = self._find_name_col(chunk.columns)
+                log.info("  Bulk file columns: %s", list(chunk.columns))
+                log.info("  Name column detected: %s", name_col)
             if name_col is None:
                 kept.append(chunk)  # can't filter, keep all
                 continue
@@ -462,15 +465,18 @@ class SwedenBulkCSV:
         log.info("  Streamed bulk file → kept %d rows", len(result))
         return result
 
+    @staticmethod
+    def _strip_bom(s: str) -> str:
+        return s.lstrip("\ufeff\ufffe\xef\xbb\xbf").replace("\u200b", "").strip()
+
     def _find_name_col(self, columns) -> str | None:
         """Find the name column from headers using _COL_MAP."""
         for col in columns:
-            key = col.lower().strip().replace(" ", "_")
+            key = self._strip_bom(col).lower().replace(" ", "_")
             if self._COL_MAP.get(key) == "name":
                 return col
-            # Also try substring match (e.g. "organisationsnamn" in a longer header)
             for map_key, canonical in self._COL_MAP.items():
-                if canonical == "name" and map_key in col.lower():
+                if canonical == "name" and map_key in key:
                     return col
         return None
 
@@ -497,7 +503,7 @@ class SwedenBulkCSV:
         """Map bulk-file columns to canonical field names."""
         mapping: dict[str, str] = {}   # canonical → original col name
         for col in self.df.columns:
-            key = col.lower().strip().replace(" ", "_")
+            key = self._strip_bom(col).lower().replace(" ", "_")
             # Exact match first
             if key in self._COL_MAP:
                 canonical = self._COL_MAP[key]
