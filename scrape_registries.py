@@ -94,6 +94,11 @@ class RegistryResult:
 # ---------------------------------------------------------------------------
 SESSION = requests.Session()
 SESSION.headers.update({"Accept": "application/json"})
+SESSION.verify = False  # some registries (cvrapi.dk) have SSL cert issues
+
+# Suppress the InsecureRequestWarning from urllib3
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 MAX_RETRIES = 3
 RETRY_BACKOFF = 2  # seconds, doubles each retry
