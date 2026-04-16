@@ -470,11 +470,17 @@ class SwedenBulkCSV:
         return s.lstrip("\ufeff\ufffe\xef\xbb\xbf").replace("\u200b", "").strip()
 
     def _find_name_col(self, columns) -> str | None:
-        """Find the name column from headers using _COL_MAP."""
+        """Find the name column from headers using _COL_MAP.
+        Two passes: exact match first, then substring (to avoid
+        'namn' matching 'namnskyddslopnummer' before 'organisationsnamn')."""
+        # Pass 1: exact match
         for col in columns:
             key = self._strip_bom(col).lower().replace(" ", "_")
             if self._COL_MAP.get(key) == "name":
                 return col
+        # Pass 2: substring match
+        for col in columns:
+            key = self._strip_bom(col).lower().replace(" ", "_")
             for map_key, canonical in self._COL_MAP.items():
                 if canonical == "name" and map_key in key:
                     return col
