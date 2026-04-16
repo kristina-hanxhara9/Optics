@@ -323,7 +323,7 @@ class SwedenBulkCSV:
     # ------------------------------------------------------------------
     def _load(self) -> pd.DataFrame:
         suffix = self.path.suffix.lower()
-        if suffix in (".csv", ".tsv"):
+        if suffix in (".csv", ".tsv", ".txt"):
             for sep in [",", ";", "\t", "|"]:
                 try:
                     df = pd.read_csv(self.path, sep=sep, dtype=str,
