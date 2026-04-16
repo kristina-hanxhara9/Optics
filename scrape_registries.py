@@ -30,17 +30,30 @@ from dataclasses import dataclass, field, asdict
 from difflib import SequenceMatcher
 from pathlib import Path
 
+# --- Check dependencies early with a clear message -----------------------
+_MISSING = []
+for _pkg in ["pandas", "openpyxl", "requests", "tqdm"]:
+    try:
+        __import__(_pkg)
+    except ImportError:
+        _MISSING.append(_pkg)
+if _MISSING:
+    print(f"ERROR: Missing packages: {', '.join(_MISSING)}")
+    print(f"       Run:  pip install -r requirements.txt")
+    sys.exit(1)
+
 import pandas as pd
 import requests
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging  –  send to BOTH stderr and stdout so output is always visible
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
+    stream=sys.stdout,
 )
 log = logging.getLogger("optics")
 
@@ -676,9 +689,15 @@ GETTING THE SWEDISH BULK DATA (FREE, no account needed)
                          "Required for Sweden lookups.")
     args = ap.parse_args()
 
+    print()
+    print("Nordic Optics — Business Registry Lookup")
+    print("=" * 42)
+
     src = Path(args.input_file)
     if not src.exists():
-        log.error("File not found: %s", src)
+        print(f"ERROR: File not found: {src}")
+        print(f"       Make sure the Excel file is in the current directory,")
+        print(f"       or provide the full path.")
         sys.exit(1)
 
     dest = Path(args.output) if args.output else src.with_name(f"{src.stem}_enriched.xlsx")
@@ -692,7 +711,7 @@ GETTING THE SWEDISH BULK DATA (FREE, no account needed)
     if args.sweden_csv:
         csv_path = Path(args.sweden_csv)
         if not csv_path.exists():
-            log.error("Swedish data file not found: %s", csv_path)
+            print(f"ERROR: Swedish data file not found: {csv_path}")
             sys.exit(1)
         registries["sweden"] = SwedenBulkCSV(str(csv_path))
     else:
