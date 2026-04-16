@@ -323,22 +323,24 @@ class SwedenBulkCSV:
     # ------------------------------------------------------------------
     def _load(self) -> pd.DataFrame:
         suffix = self.path.suffix.lower()
-        if suffix in (".csv", ".tsv", ".txt"):
-            for sep in [",", ";", "\t", "|"]:
+        if suffix in (".xlsx", ".xls"):
+            return pd.read_excel(self.path, dtype=str)
+
+        # Try as delimited text regardless of extension (.csv .tsv .txt or anything else)
+        for enc in ["utf-8", "latin-1", "cp1252"]:
+            for sep in [";", ",", "\t", "|"]:
                 try:
                     df = pd.read_csv(self.path, sep=sep, dtype=str,
-                                     encoding="utf-8", on_bad_lines="skip")
+                                     encoding=enc, on_bad_lines="skip")
                     if len(df.columns) > 1:
+                        log.info("  Parsed with sep=%r  encoding=%s  cols=%d",
+                                 sep, enc, len(df.columns))
                         return df
                 except Exception:
                     continue
-            # last resort: single-column / auto
-            return pd.read_csv(self.path, dtype=str, encoding="utf-8",
-                               on_bad_lines="skip")
-        elif suffix in (".xlsx", ".xls"):
-            return pd.read_excel(self.path, dtype=str)
-        else:
-            raise ValueError(f"Unsupported file type: {suffix}")
+        # last resort: auto-detect
+        return pd.read_csv(self.path, dtype=str, encoding="latin-1",
+                           on_bad_lines="skip")
 
     def _map_columns(self) -> dict[str, str]:
         """Map bulk-file columns to canonical field names."""
