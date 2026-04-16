@@ -213,18 +213,31 @@ class DenmarkCVR:
         self.ua = user_agent
 
     def search(self, name: str) -> RegistryResult | None:
-        # Try multiple name variations — cvrapi.dk is strict on matching
-        candidates = self._name_variations(name)
-        for candidate in candidates:
-            data = _get_json(
-                self.BASE,
-                params={"search": candidate, "country": "dk"},
-                headers={"User-Agent": self.ua},
-            )
-            if data and "error" not in data:
-                return self._parse(name, data)
-            time.sleep(0.3)  # small delay between retries
+        # Try original name first
+        data = self._call_api(name)
+        if data and "error" not in data:
+            return self._parse(name, data)
+
+        # If not found, log the error and try ONE cleaned variation
+        if data:
+            err = data.get("error", "")
+            log.debug("  CVR '%s': %s", name, err)
+            # Only retry with variation if it was a "not found" error
+            if "NOT_FOUND" in str(err).upper() or "INGEN" in str(err).upper():
+                variations = self._name_variations(name)
+                for candidate in variations[1:2]:  # try just one variation
+                    time.sleep(0.5)
+                    data = self._call_api(candidate)
+                    if data and "error" not in data:
+                        return self._parse(name, data)
         return None
+
+    def _call_api(self, search_term: str) -> dict | None:
+        return _get_json(
+            self.BASE,
+            params={"search": search_term, "country": "dk"},
+            headers={"User-Agent": self.ua},
+        )
 
     @staticmethod
     def _name_variations(name: str) -> list[str]:
@@ -866,8 +879,8 @@ GETTING THE SWEDISH BULK DATA (FREE, no account needed)
     ap.add_argument("input_file", help="Excel file (.xlsx) with optics shop names")
     ap.add_argument("-o", "--output", help="Output Excel path  [default: <input>_enriched.xlsx]")
     ap.add_argument("-n", "--name-column", help="Column with business names (auto-detected if omitted)")
-    ap.add_argument("-d", "--delay", type=float, default=0.5,
-                    help="Seconds between API calls  [default: 0.5]")
+    ap.add_argument("-d", "--delay", type=float, default=1.0,
+                    help="Seconds between API calls  [default: 1.0]")
     ap.add_argument("--countries", nargs="+", choices=["denmark", "norway", "sweden"],
                     help="Only process these countries")
     ap.add_argument("--json", action="store_true", help="Also dump raw JSON per country")
