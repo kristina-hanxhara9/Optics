@@ -213,14 +213,44 @@ class DenmarkCVR:
         self.ua = user_agent
 
     def search(self, name: str) -> RegistryResult | None:
-        data = _get_json(
-            self.BASE,
-            params={"search": name, "country": "dk"},
-            headers={"User-Agent": self.ua},
-        )
-        if not data or "error" in data:
-            return None
-        return self._parse(name, data)
+        # Try multiple name variations — cvrapi.dk is strict on matching
+        candidates = self._name_variations(name)
+        for candidate in candidates:
+            data = _get_json(
+                self.BASE,
+                params={"search": candidate, "country": "dk"},
+                headers={"User-Agent": self.ua},
+            )
+            if data and "error" not in data:
+                return self._parse(name, data)
+            time.sleep(0.3)  # small delay between retries
+        return None
+
+    @staticmethod
+    def _name_variations(name: str) -> list[str]:
+        """Generate search variations to improve match rate."""
+        variations = [name.strip()]
+        # Without common suffixes (ApS, A/S, I/S, K/S, etc.)
+        cleaned = re.sub(r"\b(aps|a/s|i/s|k/s|p/s|ivs|smba|f\.m\.b\.a)\b\.?\s*$",
+                         "", name.strip(), flags=re.IGNORECASE).strip()
+        if cleaned and cleaned != name.strip():
+            variations.append(cleaned)
+        # Without location in parentheses: "Shop Name (Copenhagen)" → "Shop Name"
+        no_parens = re.sub(r"\s*\(.*?\)\s*$", "", name.strip()).strip()
+        if no_parens and no_parens not in variations:
+            variations.append(no_parens)
+        # First two words only (for long names like "Brillehuset v/ Jens Hansen")
+        words = name.strip().split()
+        if len(words) > 2:
+            short = " ".join(words[:2])
+            if short not in variations:
+                variations.append(short)
+        # Without "v/" or "ved" owner references
+        no_owner = re.sub(r"\s+(v/|ved|v\.|c/o)\s+.*$", "", name.strip(),
+                          flags=re.IGNORECASE).strip()
+        if no_owner and no_owner not in variations:
+            variations.append(no_owner)
+        return variations
 
     def _parse(self, query: str, d: dict) -> RegistryResult:
         end = d.get("enddate")
