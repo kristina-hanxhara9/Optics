@@ -380,8 +380,12 @@ class SwedenBulkCSV:
         "pagandeavvecklingselleromstruktureringsforfarande": "liquidation_flag",  # Bolagsverket
     }
 
-    def __init__(self, file_path: str, lookup_names: list[str]):
-        self.path = Path(file_path)
+    def __init__(self, file_paths, lookup_names: list[str]):
+        # Accept either a single path or a list of paths
+        if isinstance(file_paths, (str, Path)):
+            file_paths = [file_paths]
+        self.paths = [Path(p) for p in file_paths]
+        self.path = self.paths[0]  # primary path (for backwards-compat logging)
         self.lookup_names = lookup_names
 
         # Build keywords from the names we actually need to find
@@ -390,12 +394,29 @@ class SwedenBulkCSV:
             for word in _normalise(name).split():
                 if len(word) > 2:
                     self._keywords.add(word)
-        log.info("Swedish bulk file: %s", self.path)
+        log.info("Swedish bulk file(s): %s", [str(p) for p in self.paths])
         log.info("  Filtering for %d shop names (%d keywords)",
                  len(lookup_names), len(self._keywords))
 
-        self.df = self._load_filtered()
-        self._clean_column_names()   # strip BOM, whitespace, invisible chars
+        # Load & merge all files
+        frames = []
+        for p in self.paths:
+            self.path = p   # _load_filtered reads from self.path
+            log.info("  Loading %s …", p.name)
+            df = self._load_filtered()
+            if df.empty:
+                continue
+            df.columns = [self._strip_bom(c) for c in df.columns]
+            frames.append(df)
+
+        if not frames:
+            self.df = pd.DataFrame()
+        elif len(frames) == 1:
+            self.df = frames[0]
+        else:
+            self.df = self._merge_frames(frames)
+
+        self._clean_column_names()
         log.info("  Columns after cleaning: %s", list(self.df.columns))
         self.col_mapping = self._map_columns()
         log.info("  Detected column mapping: %s", self.col_mapping)
@@ -493,6 +514,48 @@ class SwedenBulkCSV:
         log.info("  Name column detected: %s", name_col)
         log.info("  Loaded %d matching rows", len(df))
         return df
+
+    def _merge_frames(self, frames: list[pd.DataFrame]) -> pd.DataFrame:
+        """Merge multiple Swedish bulk files by org number.
+        Fills in missing values from later frames (e.g. Bolagsverket adds
+        verksamhetsbeskrivning; SCB adds SNI codes + postal + city)."""
+        # Find org_number column in each frame
+        def _orgnr_col(df):
+            for col in df.columns:
+                key = self._strip_bom(col).lower().replace(" ", "_")
+                if self._COL_MAP.get(key) == "org_number":
+                    return col
+            return None
+
+        merged = frames[0].copy()
+        orgnr0 = _orgnr_col(merged)
+        if orgnr0:
+            merged["_orgnr_key"] = merged[orgnr0].astype(str).str.replace(r"\D", "", regex=True)
+        else:
+            merged["_orgnr_key"] = ""
+
+        for df in frames[1:]:
+            orgnr_col = _orgnr_col(df)
+            if not orgnr_col or not orgnr0:
+                # No org number in one of the frames → just concat
+                merged = pd.concat([merged, df], ignore_index=True, sort=False)
+                continue
+            df = df.copy()
+            df["_orgnr_key"] = df[orgnr_col].astype(str).str.replace(r"\D", "", regex=True)
+            # Merge: left join, suffix duplicates with _right
+            combined = merged.merge(df, on="_orgnr_key", how="outer", suffixes=("", "_r"))
+            # For each duplicate col, prefer left value, fall back to right
+            for col in list(combined.columns):
+                if col.endswith("_r"):
+                    base = col[:-2]
+                    if base in combined.columns:
+                        combined[base] = combined[base].fillna(combined[col])
+                        combined.drop(columns=[col], inplace=True)
+            merged = combined
+
+        merged.drop(columns=["_orgnr_key"], errors="ignore", inplace=True)
+        log.info("  Merged %d files → %d total rows", len(frames), len(merged))
+        return merged
 
     @staticmethod
     def _strip_bom(s: str) -> str:
@@ -886,9 +949,11 @@ GETTING THE SWEDISH BULK DATA (FREE, no account needed)
     ap.add_argument("--json", action="store_true", help="Also dump raw JSON per country")
     ap.add_argument("--user-agent", default="OpticsScraper/1.0 (contact@example.com)",
                     help="User-Agent for cvrapi.dk  [default: generic]")
-    ap.add_argument("--sweden-csv", metavar="PATH",
-                    help="Path to Swedish bulk company data (CSV/XLSX) from Bolagsverket. "
-                         "Required for Sweden lookups.")
+    ap.add_argument("--sweden-csv", metavar="PATH", nargs="+",
+                    help="Path(s) to Swedish bulk company data files. "
+                         "Pass multiple to merge: --sweden-csv scb_bulkfil.txt "
+                         "bolagsverket_bulkfil.txt (SCB has SNI codes + address, "
+                         "Bolagsverket adds business descriptions).")
     args = ap.parse_args()
 
     print()
@@ -915,9 +980,10 @@ GETTING THE SWEDISH BULK DATA (FREE, no account needed)
 
     # --- Sweden: extract lookup names first, then load only matching rows --
     if args.sweden_csv:
-        csv_path = Path(args.sweden_csv)
-        if not csv_path.exists():
-            print(f"ERROR: Swedish data file not found: {csv_path}")
+        csv_paths = [Path(p) for p in args.sweden_csv]
+        missing = [p for p in csv_paths if not p.exists()]
+        if missing:
+            print(f"ERROR: Swedish data file(s) not found: {missing}")
             sys.exit(1)
         # Get the Swedish shop names from the Excel
         se_names = []
@@ -927,7 +993,7 @@ GETTING THE SWEDISH BULK DATA (FREE, no account needed)
                 se_names = info["df"][col].dropna().astype(str).str.strip().tolist()
                 se_names = [n for n in se_names if n and n.lower() != "nan"]
         if se_names:
-            registries["sweden"] = SwedenBulkCSV(str(csv_path), se_names)
+            registries["sweden"] = SwedenBulkCSV([str(p) for p in csv_paths], se_names)
         else:
             log.warning("No Swedish shop names found in Excel — skipping Sweden")
     else:
